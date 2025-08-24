@@ -1,5 +1,6 @@
-# qt_roguelike.py — PyQt6 GUI Roguelike (XP + Depth + FOV + Multiple Enemies)
-# Adds: visible potions + tile renderer (toggle ASCII/Tiles with T)
+# qt_roguelike.py — PyQt6 GUI Roguelike
+# New: First-person viewport (lower-left) via ray casting; rotate with Q/E (no turn cost).
+# Still includes: Inventory tab, safe visibility pipeline, tiles/ASCII toggle (T), potions drawn.
 # Install:  python -m pip install PyQt6
 
 from __future__ import annotations
@@ -9,8 +10,8 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Set
 
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush
+from PyQt6.QtCore import Qt, QSize, QPoint
+from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPolygon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QPlainTextEdit, QSplitter, QTabWidget
@@ -27,6 +28,11 @@ LOG_MAX = 160
 
 WALL, FLOOR, STAIRS, POTION = '#', '.', '>', '!'
 PLAYER_GLYPH = 'S'
+
+# FP viewport defaults
+FP_FOV_DEG = 66.0         # field of view for first-person
+FP_MIN_DIST = 0.05
+FP_MAX_DIST = 20.0
 
 ENEMIES: Dict[str, Dict] = {
     "goblin": {"ch": "g", "hp": 5,  "atk": 8,  "dmg": (1, 2), "ai": "melee",  "speed": 1, "xp": 8},
@@ -77,6 +83,8 @@ class Player:
     level: int = 1
     xp: int = 0
     next_xp: int = 0
+    equipment: Dict[str, str] = field(default_factory=lambda: {"weapon": "Axe", "armor": "Cloth"})
+    angle: float = 0.0  # NEW: facing angle in radians (0 = east). Updated on move/rotate.
 
 
 @dataclass
@@ -90,6 +98,7 @@ class Game:
     items: List[Tuple[int, int, str]]  # (x,y,'potion')
     stairs: Tuple[int, int]
     explored: Set[Tuple[int, int]] = field(default_factory=set)
+    visible: Set[Tuple[int, int]] = field(default_factory=set)
     log: List[str] = field(default_factory=lambda: ["You shoulder your axe and enter."])
     over: bool = False
 
@@ -182,12 +191,19 @@ def los_clear(grid, x0, y0, x1, y1):
 
 def fov(player: Player, grid) -> Set[Tuple[int, int]]:
     out = set()
+    out.add((player.x, player.y))
     for y in range(max(0, player.y - FOV_RADIUS), min(MAP_H, player.y + FOV_RADIUS + 1)):
         for x in range(max(0, player.x - FOV_RADIUS), min(MAP_W, player.x + FOV_RADIUS + 1)):
             if (x - player.x) ** 2 + (y - player.y) ** 2 <= FOV_RADIUS ** 2:
                 if los_clear(grid, player.x, player.y, x, y):
                     out.add((x, y))
     return out
+
+
+def update_visibility(g: Game):
+    vis = fov(g.player, g.grid)
+    g.visible = vis
+    g.explored.update(vis)
 
 
 # -------------------------
@@ -355,6 +371,9 @@ def ai_turn(g: Game):
 # PLAYER ACTIONS / FLOORS
 # -------------------------
 def try_move_player(g: Game, dx: int, dy: int):
+    if dx != 0 or dy != 0:
+        # update facing angle to match movement direction
+        g.player.angle = math.atan2(dy, dx)  # y first, then x
     nx, ny = max(0, min(MAP_W - 1, g.player.x + dx)), max(0, min(MAP_H - 1, g.player.y + dy))
     if g.grid[ny][nx] == WALL:
         return
@@ -382,6 +401,11 @@ def try_move_player(g: Game, dx: int, dy: int):
         new_floor(g)
 
 
+def rotate_player(g: Game, delta_deg: float):
+    """Rotate without advancing time (Eye of the Beholder style)."""
+    g.player.angle = (g.player.angle + math.radians(delta_deg)) % (2 * math.pi)
+
+
 def use_potion(g: Game):
     if g.player.potions <= 0:
         return
@@ -397,11 +421,17 @@ def new_floor(g: Game = None) -> Game:
         attrs = roll_base_attrs()
         max_hp, atk, par = derive(attrs)
         p = Player(1, 1, attrs, atk, par, max_hp, max_hp, 0, 1, 0, xp_threshold(1))
-        g = Game(1, 1, grid, rooms, p, [], [], (0, 0), set(), ["You shoulder your axe and enter."], False)
+        g = Game(1, 1, grid, rooms, p, [], [], (0, 0), set(), set(), ["You shoulder your axe and enter."], False)
         spawn_mobs_items(g)
+        update_visibility(g)
         return g
+    # preserve facing angle on new floor
+    ang = g.player.angle
     g.grid, g.rooms, g.mobs, g.items, g.explored = grid, rooms, [], [], set()
+    g.visible = set()
     spawn_mobs_items(g)
+    g.player.angle = ang
+    update_visibility(g)
     return g
 
 
@@ -411,6 +441,7 @@ def new_floor(g: Game = None) -> Game:
 class MapWidget(QWidget):
     """
     Paints the map & actors. Supports ASCII and tile modes (toggle with T).
+    Rendering is PURE (no state writes).
     """
     def __init__(self, game: Game, parent=None):
         super().__init__(parent)
@@ -441,7 +472,6 @@ class MapWidget(QWidget):
         px, py = x * self.tile_w, y * self.tile_h
         base = QColor("#94a3b8" if in_vis else "#cbd5e1")
         p.fillRect(px, py, self.tile_w, self.tile_h, base)
-        # simple brick lines
         p.setPen(QPen(QColor("#64748b" if in_vis else "#94a3b8"), 1))
         p.drawLine(px, py + self.tile_h//2, px + self.tile_w, py + self.tile_h//2)
         p.drawLine(px + self.tile_w//3, py, px + self.tile_w//3, py + self.tile_h//2)
@@ -452,29 +482,27 @@ class MapWidget(QWidget):
         self.draw_floor(p, x, y, in_vis)
         p.setBrush(QBrush(QColor("#06b6d4")))
         p.setPen(Qt.PenStyle.NoPen)
-        # little chevron
         m = 4
-        p.drawPolygon(
-            *[ (px+m,py+m), (px+self.tile_w-m,py+m), (px+self.tile_w-2*m,py+2*m),
-               (px+2*m,py+2*m) ]
-        )
+        poly = QPolygon([
+            QPoint(px + m, py + m),
+            QPoint(px + self.tile_w - m, py + m),
+            QPoint(px + self.tile_w - 2*m, py + 2*m),
+            QPoint(px + 2*m, py + 2*m),
+        ])
+        p.drawPolygon(poly)
 
     def draw_potion(self, p, x, y, in_vis):
         px, py = x * self.tile_w, y * self.tile_h
         self.draw_floor(p, x, y, in_vis)
-        # flask
-        body = QColor("#a855f7")  # purple
+        body = QColor("#a855f7")
         glass = QColor("#ede9fe")
         neck = QColor("#7c3aed")
         p.setPen(Qt.PenStyle.NoPen)
-        # bulb
         p.setBrush(QBrush(body))
         r = min(self.tile_w, self.tile_h) // 2 - 3
         p.drawEllipse(px + self.tile_w//2 - r, py + self.tile_h//2 - r + 2, 2*r, 2*r)
-        # neck
         p.setBrush(QBrush(neck))
         p.drawRect(px + self.tile_w//2 - 3, py + 3, 6, 6)
-        # highlight
         p.setBrush(QBrush(glass))
         p.drawEllipse(px + self.tile_w//2, py + self.tile_h//2 - 2, 5, 5)
 
@@ -485,19 +513,17 @@ class MapWidget(QWidget):
         p.setBrush(QBrush(QColor(color)))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(px+3, py+3, self.tile_w-6, self.tile_h-6)
-        # glyph
         p.setPen(QPen(QColor("#ffffff"), 1))
         p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
         p.drawText(px+4, py+self.tile_h-5, ENEMIES[kind]["ch"])
 
-    def draw_player(self, p, x, y, in_vis):
+    def draw_player(self, p, x, y):
         px, py = x * self.tile_w, y * self.tile_h
-        self.draw_floor(p, x, y, in_vis)
+        self.draw_floor(p, x, y, True)
         p.setBrush(QBrush(QColor("#f59e0b")))
         p.setPen(Qt.PenStyle.NoPen)
         r = min(self.tile_w, self.tile_h)//2 - 2
         p.drawEllipse(px + self.tile_w//2 - r, py + self.tile_h//2 - r, 2*r, 2*r)
-        # small axe slash accent
         p.setPen(QPen(QColor("#78350f"), 2))
         p.drawLine(px + self.tile_w//2, py + self.tile_h//2, px + self.tile_w//2 + 6, py + self.tile_h//2 - 6)
 
@@ -506,17 +532,14 @@ class MapWidget(QWidget):
         p = QPainter(self)
         p.setFont(self.font)
         fm = p.fontMetrics()
-        # Keep a sensible minimum size from font
         self.tile_w = max(self.tile_w, fm.horizontalAdvance("M"))
         self.tile_h = max(self.tile_h, fm.height())
 
         g = self.game
-        vis = fov(g.player, g.grid)
-        for vx, vy in vis:
-            g.explored.add((vx, vy))
+        vis = g.visible
+        exp = g.explored
 
         if self.use_tiles:
-            # TILE MODE
             for y in range(MAP_H):
                 for x in range(MAP_W):
                     in_vis = (x, y) in vis
@@ -524,55 +547,176 @@ class MapWidget(QWidget):
                     if ch == WALL:
                         self.draw_wall(p, x, y, in_vis)
                     else:
-                        self.draw_floor(p, x, y, in_vis)
+                        self.draw_floor(p, x, y, in_vis if (x, y) in exp else False)
 
-            # items (POTIONS) — draw before mobs/player so they can be covered if occupied
             for (ix, iy, typ) in g.items:
-                if (ix, iy) in g.explored:
-                    if typ == "potion":
-                        self.draw_potion(p, ix, iy, (ix, iy) in vis)
+                if (ix, iy) in exp and typ == "potion":
+                    self.draw_potion(p, ix, iy, (ix, iy) in vis)
 
-            # stairs
             sx, sy = g.stairs
-            if (sx, sy) in g.explored:
+            if (sx, sy) in exp:
                 self.draw_stairs(p, sx, sy, (sx, sy) in vis)
 
-            # mobs
             for m in g.mobs:
-                if not m.alive: continue
-                if (m.x, m.y) in g.explored:
+                if m.alive and (m.x, m.y) in exp:
                     self.draw_enemy(p, m.x, m.y, m.name, (m.x, m.y) in vis)
 
-            # player
-            self.draw_player(p, g.player.x, g.player.y, True)
+            self.draw_player(p, g.player.x, g.player.y)
 
         else:
-            # ASCII MODE (original)
-            def draw_cell(x, y, ch, in_vis, exp):
+            def draw_cell(x, y, ch, in_vis, was_seen):
                 px = x * self.tile_w; py = y * self.tile_h
-                bg = QColor("#f1f5f9") if in_vis else QColor("#e5e7eb") if exp else QColor("#ffffff")
+                bg = QColor("#f1f5f9") if in_vis else QColor("#e5e7eb") if was_seen else QColor("#ffffff")
                 p.fillRect(px, py, self.tile_w, self.tile_h, bg)
-                if exp:
+                if was_seen:
                     fg = QColor("#111827") if in_vis else QColor("#6b7280")
                     p.setPen(fg)
                     p.drawText(px, py + fm.ascent() + (self.tile_h - fm.height())//2, ch)
 
-            # base map
             for y in range(MAP_H):
                 for x in range(MAP_W):
                     ch = g.grid[y][x]
                     if (x, y) == g.stairs: ch = STAIRS
-                    # overlay: items
                     for it in g.items:
-                        if (it[0], it[1]) == (x, y):
-                            ch = '!'  # potion
-                    # overlay: mobs
+                        if (it[0], it[1]) == (x, y): ch = '!'
                     for m in g.mobs:
-                        if m.alive and (m.x, m.y) == (x, y):
-                            ch = ENEMIES[m.name]["ch"]; break
-                    if (g.player.x, g.player.y) == (x, y):
-                        ch = PLAYER_GLYPH
-                    draw_cell(x, y, ch, (x, y) in vis, (x, y) in g.explored)
+                        if m.alive and (m.x, m.y) == (x, y): ch = ENEMIES[m.name]["ch"]; break
+                    if (g.player.x, g.player.y) == (x, y): ch = PLAYER_GLYPH
+                    draw_cell(x, y, ch, (x, y) in vis, (x, y) in exp)
+
+        p.end()
+
+
+class FirstPersonWidget(QWidget):
+    """
+    Renders a simple Eye-of-the-Beholder style first-person view using ray casting.
+    Uses grid walls ('#') and player's facing angle. No assets required.
+    """
+    def __init__(self, game: Game, parent=None):
+        super().__init__(parent)
+        self.game = game
+        self.setMinimumHeight(220)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def setGame(self, g: Game):
+        self.game = g
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        return QSize(600, 220)
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        w = max(200, self.width())
+        h = max(160, self.height())
+
+        # background sky/floor gradient
+        sky = QColor("#e0f2fe")
+        floor = QColor("#f8fafc")
+        p.fillRect(0, 0, w, h//2, sky)
+        p.fillRect(0, h//2, w, h//2, floor)
+
+        g = self.game
+        px = g.player.x + 0.5
+        py = g.player.y + 0.5
+        ang = g.player.angle
+        fov = math.radians(FP_FOV_DEG)
+
+        # number of vertical slices to draw
+        columns = min(w, 240)
+        col_w = w / columns
+
+        # colors
+        wall_light = QColor("#94a3b8")
+        wall_dark = QColor("#64748b")  # darker for side hits
+        fog = QColor(0, 0, 0, 140)     # distance fog overlay
+
+        for i in range(columns):
+            # ray angle across FOV
+            rel = (i / (columns - 1)) - 0.5  # -0.5 .. +0.5
+            ray_ang = ang + rel * fov
+            ray_dx = math.cos(ray_ang)
+            ray_dy = math.sin(ray_ang)
+
+            # DDA setup
+            map_x = int(px)
+            map_y = int(py)
+
+            delta_dist_x = abs(1.0 / (ray_dx if ray_dx != 0 else 1e-6))
+            delta_dist_y = abs(1.0 / (ray_dy if ray_dy != 0 else 1e-6))
+
+            if ray_dx < 0:
+                step_x = -1
+                side_dist_x = (px - map_x) * delta_dist_x
+            else:
+                step_x = 1
+                side_dist_x = (map_x + 1.0 - px) * delta_dist_x
+
+            if ray_dy < 0:
+                step_y = -1
+                side_dist_y = (py - map_y) * delta_dist_y
+            else:
+                step_y = 1
+                side_dist_y = (map_y + 1.0 - py) * delta_dist_y
+
+            hit = False
+            side = 0  # 0 = x side, 1 = y side
+            dist = FP_MAX_DIST
+
+            for _ in range(128):  # max steps
+                if side_dist_x < side_dist_y:
+                    side_dist_x += delta_dist_x
+                    map_x += step_x
+                    side = 0
+                else:
+                    side_dist_y += delta_dist_y
+                    map_y += step_y
+                    side = 1
+
+                if not (0 <= map_x < MAP_W and 0 <= map_y < MAP_H):
+                    break
+
+                if g.grid[map_y][map_x] == WALL:
+                    hit = True
+                    # perpendicular distance to avoid fish-eye
+                    if side == 0:
+                        dist = (map_x - px + (1 - step_x) / 2) / (ray_dx if ray_dx != 0 else 1e-6)
+                    else:
+                        dist = (map_y - py + (1 - step_y) / 2) / (ray_dy if ray_dy != 0 else 1e-6)
+                    break
+
+            if not hit:
+                continue
+
+            dist = max(FP_MIN_DIST, min(FP_MAX_DIST, abs(dist)))
+            # wall height proportional to inverse distance
+            line_h = int(h / (dist + 0.0001))
+            line_h = min(h - 4, line_h)
+            y0 = max(2, (h - line_h) // 2)
+            y1 = min(h - 2, y0 + line_h)
+
+            # shade by side and distance
+            base = wall_light if side == 0 else wall_dark
+            shade = max(0.25, 1.0 - (dist / FP_MAX_DIST))
+            col = QColor(
+                int(base.red() * shade),
+                int(base.green() * shade),
+                int(base.blue() * shade)
+            )
+            p.setPen(QPen(col, max(1, int(col_w))))
+            x = int(i * col_w)
+            p.drawLine(x, y0, x, y1)
+
+            # subtle fog overlay with alpha increasing by distance
+            a = int(160 * (dist / FP_MAX_DIST))
+            p.setPen(QPen(QColor(fog.red(), fog.green(), fog.blue(), a), max(1, int(col_w))))
+            p.drawLine(x, y0, x, y1)
+
+        # small compass
+        compass = f"⟲ Q  E ⟳   Facing: {int((math.degrees(ang)%360)+0.5)}°"
+        p.setPen(QPen(QColor("#0f172a")))
+        p.setFont(QFont("Consolas", 10))
+        p.drawText(8, 16, compass)
 
         p.end()
 
@@ -586,8 +730,9 @@ class StatsPanel(QWidget):
         self.stats1 = QLabel()
         self.stats2 = QLabel()
         self.stats3 = QLabel()
+        self.potions_lbl = QLabel()
 
-        for lbl in (self.title, self.stats1, self.stats2, self.stats3):
+        for lbl in (self.title, self.stats1, self.stats2, self.stats3, self.potions_lbl):
             lbl.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
 
         btn_row = QHBoxLayout()
@@ -605,6 +750,7 @@ class StatsPanel(QWidget):
         layout.addWidget(self.stats1)
         layout.addWidget(self.stats2)
         layout.addWidget(self.stats3)
+        layout.addWidget(self.potions_lbl)
         layout.addSpacing(8)
         layout.addLayout(btn_row)
         layout.addStretch(1)
@@ -616,6 +762,7 @@ class StatsPanel(QWidget):
         self.stats1.setText(f"HP {g.player.hp}/{g.player.max_hp}    Turn {g.turn}")
         self.stats2.setText(f"Lvl {g.player.level}    XP {g.player.xp}/{g.player.next_xp}")
         self.stats3.setText(f"AT {g.player.atk}   PA {g.player.par}")
+        self.potions_lbl.setText(f"Potions: {g.player.potions}")
 
 
 class LogPanel(QPlainTextEdit):
@@ -630,6 +777,25 @@ class LogPanel(QPlainTextEdit):
         self.setPlainText("\n".join(f"• {line}" for line in newest_first))
 
 
+class InventoryPanel(QPlainTextEdit):
+    def __init__(self, game: Game, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        self.updateFromGame(game)
+
+    def updateFromGame(self, g: Game):
+        eq = g.player.equipment
+        lines = []
+        lines.append("== Equipment ==")
+        for slot in ("weapon", "armor"):
+            lines.append(f"  {slot.capitalize()}: {eq.get(slot, '-')}")
+        lines.append("")
+        lines.append("== Inventory ==")
+        lines.append(f"  Potions: {g.player.potions}")
+        self.setPlainText("\n".join(lines))
+
+
 # -------------------------
 # MAIN WINDOW
 # -------------------------
@@ -640,23 +806,31 @@ class MainWindow(QMainWindow):
 
         self.game: Game = new_floor(None)
 
-        # central splitter
+        # LEFT: Map (top) + FP view (bottom)
+        left_col = QWidget()
+        left_layout = QVBoxLayout(left_col)
+        left_layout.setContentsMargins(0,0,0,0)
+        left_layout.setSpacing(6)
         self.map_widget = MapWidget(self.game)
+        self.fp_widget = FirstPersonWidget(self.game)
+        left_layout.addWidget(self.map_widget, 3)
+        left_layout.addWidget(self.fp_widget, 1)
+
+        # RIGHT: Tabs
         self.side_tabs = QTabWidget()
-
         self.stats_panel = StatsPanel(self.game)
+        self.inv_panel = InventoryPanel(self.game)
         self.log_panel = LogPanel(self.game)
-
         self.side_tabs.addTab(self.stats_panel, "Stats")
+        self.side_tabs.addTab(self.inv_panel, "Inventory")
         self.side_tabs.addTab(self.log_panel, "Log")
 
         split = QSplitter()
-        split.addWidget(self.map_widget)
+        split.addWidget(left_col)
         split.addWidget(self.side_tabs)
         split.setStretchFactor(0, 1)
         split.setStretchFactor(1, 0)
 
-        # wrap in central widget
         cw = QWidget()
         lay = QHBoxLayout(cw)
         lay.addWidget(split)
@@ -668,13 +842,16 @@ class MainWindow(QMainWindow):
         self.stats_panel.btn_new.clicked.connect(self.on_new)
         self.stats_panel.btn_toggle.clicked.connect(self.on_toggle)
 
-        self.resize(1120, 680)
+        self.resize(1280, 800)
         self.map_widget.setFocus()
 
     # ---- helpers ----
     def refresh(self):
+        update_visibility(self.game)
         self.map_widget.update()
+        self.fp_widget.update()
         self.stats_panel.updateFromGame(self.game)
+        self.inv_panel.updateFromGame(self.game)
         self.log_panel.updateFromGame(self.game)
 
     def end_turn(self):
@@ -705,6 +882,7 @@ class MainWindow(QMainWindow):
     def on_new(self):
         self.game = new_floor(None)
         self.map_widget.setGame(self.game)
+        self.fp_widget.setGame(self.game)
         self.refresh()
         self.map_widget.setFocus()
 
@@ -717,11 +895,21 @@ class MainWindow(QMainWindow):
         key = e.key()
         mod = e.modifiers()
 
+        # rotate (no turn)
+        if key == Qt.Key.Key_Q:
+            rotate_player(self.game, -15)
+            self.refresh()
+            return
+        if key == Qt.Key.Key_E:
+            rotate_player(self.game, +15)
+            self.refresh()
+            return
+
         # movement
         if key in (Qt.Key.Key_Up, Qt.Key.Key_W): return self.action_or_move(0, -1)
         if key in (Qt.Key.Key_Down, Qt.Key.Key_S): return self.action_or_move(0, 1)
         if key in (Qt.Key.Key_Left, Qt.Key.Key_A): return self.action_or_move(-1, 0)
-        if key in (Qt.Key.Key_Right, Qt.Key.Key_D): return self.action_or_move(1, 0)
+        if key in (Qt.Key.Key_Right, Qt.Key.Key_D,): return self.action_or_move(1, 0)
 
         # wait
         if key == Qt.Key.Key_Period and mod == Qt.KeyboardModifier.NoModifier:
